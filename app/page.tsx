@@ -1,5 +1,5 @@
 "use client";
-import React, { JSX, useRef, useState } from "react";
+import React, { JSX, useEffect, useRef, useState } from "react";
 
 // /Users/suteemonv/Codes/Github/SchedConvert/schedconvert/app/page.tsx
 
@@ -232,11 +232,219 @@ const CalendarExporter = {
 };
 
 /* ============================
+Google Calendar Service
+============================ */
+type GoogleCalendarService = {
+  tokenClient: any;
+  isSignedIn: boolean;
+  userEmail: string | null;
+  initialize: (clientId: string) => void;
+  signIn: () => Promise<void>;
+  signOut: () => void;
+  createEvent: (event: EventModel, attendees?: string[]) => Promise<boolean>;
+  createEvents: (
+    events: EventModel[],
+    attendees?: string[]
+  ) => Promise<{ success: number; failed: number }>;
+};
+
+const GoogleCalendar: GoogleCalendarService = {
+  tokenClient: null,
+  isSignedIn: false,
+  userEmail: null,
+
+  initialize(clientId: string) {
+    if (typeof window === "undefined" || !(window as any).google) {
+      console.error("Google Identity Services not loaded");
+      return;
+    }
+
+    this.tokenClient = (window as any).google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: "https://www.googleapis.com/auth/calendar.events",
+      callback: (tokenResponse: any) => {
+        if (tokenResponse && tokenResponse.access_token) {
+          this.isSignedIn = true;
+          // Store token for later use
+          if (typeof window !== "undefined") {
+            (window as any).__google_calendar_token =
+              tokenResponse.access_token;
+          }
+          // Get user info
+          fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+            headers: {
+              Authorization: `Bearer ${tokenResponse.access_token}`,
+            },
+          })
+            .then((res) => res.json())
+            .then((data) => {
+              this.userEmail = data.email || null;
+              // Trigger a custom event to notify React component
+              if (typeof window !== "undefined") {
+                window.dispatchEvent(
+                  new CustomEvent("google-calendar-signed-in", {
+                    detail: { email: data.email },
+                  })
+                );
+              }
+            })
+            .catch(() => {
+              this.userEmail = null;
+            });
+        }
+      },
+    });
+  },
+
+  async signIn() {
+    if (!this.tokenClient) {
+      throw new Error(
+        "Google Calendar not initialized. Please provide GOOGLE_CLIENT_ID."
+      );
+    }
+    this.tokenClient.requestAccessToken({ prompt: "consent" });
+  },
+
+  signOut() {
+    if (typeof window !== "undefined" && (window as any).google) {
+      const token = (window as any).__google_calendar_token;
+      if (token) {
+        (window as any).google.accounts.oauth2.revoke(token, () => {
+          (window as any).__google_calendar_token = null;
+        });
+      }
+    }
+    this.isSignedIn = false;
+    this.userEmail = null;
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("google-calendar-signed-out"));
+    }
+  },
+
+  async createEvent(event: EventModel, attendees?: string[]): Promise<boolean> {
+    if (!this.isSignedIn || !this.tokenClient) {
+      throw new Error("Not signed in to Google Calendar");
+    }
+
+    const token =
+      typeof window !== "undefined"
+        ? (window as any).__google_calendar_token
+        : null;
+    if (!token) {
+      throw new Error("No access token available");
+    }
+
+    const startDate = new Date(event.start);
+    const endDate = new Date(event.end);
+
+    type GoogleCalendarEvent = {
+      summary: string;
+      location?: string;
+      description?: string;
+      start: {
+        dateTime: string;
+        timeZone: string;
+      };
+      end: {
+        dateTime: string;
+        timeZone: string;
+      };
+      attendees?: Array<{ email: string }>;
+    };
+
+    const eventData: GoogleCalendarEvent = {
+      summary: event.title,
+      location: event.location || undefined,
+      description: formattedNotesText(event.notes) || undefined,
+      start: {
+        dateTime: startDate.toISOString(),
+        timeZone: "Asia/Bangkok",
+      },
+      end: {
+        dateTime: endDate.toISOString(),
+        timeZone: "Asia/Bangkok",
+      },
+    };
+
+    // Add attendees if provided
+    if (attendees && attendees.length > 0) {
+      eventData.attendees = attendees
+        .map((email) => email.trim())
+        .filter((email) => email.length > 0)
+        .map((email) => ({ email }));
+    }
+
+    try {
+      const response = await fetch(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(eventData),
+        }
+      );
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error?.message || "Failed to create event");
+      }
+
+      return true;
+    } catch (error) {
+      console.error("Error creating calendar event:", error);
+      throw error;
+    }
+  },
+
+  async createEvents(
+    events: EventModel[],
+    attendees?: string[]
+  ): Promise<{ success: number; failed: number }> {
+    let success = 0;
+    let failed = 0;
+
+    for (const event of events) {
+      try {
+        await this.createEvent(event, attendees);
+        success++;
+        // Small delay to avoid rate limiting
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      } catch (error) {
+        failed++;
+        console.error(`Failed to create event: ${event.title}`, error);
+      }
+    }
+
+    return { success, failed };
+  },
+};
+
+/* ============================
 App Component
 ============================ */
 export default function Home(): JSX.Element {
   const [inputText, setInputText] = useState<string>("");
   const [events, setEvents] = useState<EventModel[]>([]);
+  const [isGoogleSignedIn, setIsGoogleSignedIn] = useState<boolean>(false);
+  const [googleUserEmail, setGoogleUserEmail] = useState<string | null>(null);
+  const [isAddingToCalendar, setIsAddingToCalendar] = useState<boolean>(false);
+  const [googleClientId, setGoogleClientId] = useState<string>("");
+  const [sharedEmails, setSharedEmails] = useState<string[]>(() => {
+    // Initialize from environment variable if available
+    const envEmails = process.env.NEXT_PUBLIC_SHARED_EMAILS;
+    if (envEmails) {
+      return envEmails
+        .split(",")
+        .map((e) => e.trim())
+        .filter((e) => e.length > 0);
+    }
+    return [];
+  });
+  const [newEmailInput, setNewEmailInput] = useState<string>("");
+  const [showEmailManager, setShowEmailManager] = useState<boolean>(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const handleConvert = () => {
@@ -257,6 +465,140 @@ export default function Home(): JSX.Element {
   const handleDownload = () => {
     if (events.length === 0) return;
     CalendarExporter.downloadICSFile(events);
+  };
+
+  // Initialize Google Calendar when script loads
+  useEffect(() => {
+    const checkGoogleLoaded = () => {
+      if (typeof window !== "undefined" && (window as any).google) {
+        // Get client ID from environment variable or state
+        const clientId =
+          process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || googleClientId;
+        if (clientId) {
+          GoogleCalendar.initialize(clientId);
+          // Check if already signed in (token stored)
+          const storedToken = (window as any).__google_calendar_token;
+          if (storedToken) {
+            GoogleCalendar.isSignedIn = true;
+            setIsGoogleSignedIn(true);
+            // Get user email
+            fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+              headers: {
+                Authorization: `Bearer ${storedToken}`,
+              },
+            })
+              .then((res) => res.json())
+              .then((data) => {
+                GoogleCalendar.userEmail = data.email || null;
+                setGoogleUserEmail(data.email || null);
+              })
+              .catch(() => {
+                GoogleCalendar.userEmail = null;
+                setGoogleUserEmail(null);
+              });
+          }
+        }
+      } else {
+        // Retry after a short delay
+        setTimeout(checkGoogleLoaded, 100);
+      }
+    };
+    checkGoogleLoaded();
+
+    // Listen for sign-in events
+    const handleSignIn = (e: any) => {
+      setIsGoogleSignedIn(true);
+      setGoogleUserEmail(e.detail?.email || null);
+    };
+    const handleSignOut = () => {
+      setIsGoogleSignedIn(false);
+      setGoogleUserEmail(null);
+    };
+
+    window.addEventListener("google-calendar-signed-in", handleSignIn);
+    window.addEventListener("google-calendar-signed-out", handleSignOut);
+
+    return () => {
+      window.removeEventListener("google-calendar-signed-in", handleSignIn);
+      window.removeEventListener("google-calendar-signed-out", handleSignOut);
+    };
+  }, [googleClientId]);
+
+  const handleGoogleSignIn = async () => {
+    try {
+      const clientId =
+        process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || googleClientId;
+      if (!clientId) {
+        alert(
+          "Please provide a Google Client ID. You can set it in the header or via NEXT_PUBLIC_GOOGLE_CLIENT_ID environment variable."
+        );
+        return;
+      }
+      if (!GoogleCalendar.tokenClient) {
+        GoogleCalendar.initialize(clientId);
+      }
+      await GoogleCalendar.signIn();
+      // State will be updated via event listeners
+    } catch (error) {
+      console.error("Error signing in:", error);
+      alert(
+        "Failed to sign in to Google Calendar. Please check your client ID."
+      );
+    }
+  };
+
+  const handleGoogleSignOut = () => {
+    GoogleCalendar.signOut();
+    setIsGoogleSignedIn(false);
+    setGoogleUserEmail(null);
+  };
+
+  const handleAddToGoogleCalendar = async () => {
+    if (!isGoogleSignedIn) {
+      await handleGoogleSignIn();
+      return;
+    }
+
+    if (events.length === 0) return;
+
+    setIsAddingToCalendar(true);
+    try {
+      const result = await GoogleCalendar.createEvents(events, sharedEmails);
+      alert(
+        `Successfully added ${result.success} event(s) to your Google Calendar${
+          result.failed > 0 ? `\n${result.failed} event(s) failed` : ""
+        }${
+          sharedEmails.length > 0
+            ? `\nShared with ${sharedEmails.length} attendee(s)`
+            : ""
+        }`
+      );
+    } catch (error: any) {
+      console.error("Error adding events to calendar:", error);
+      alert(
+        `Failed to add events to calendar: ${error.message || "Unknown error"}`
+      );
+    } finally {
+      setIsAddingToCalendar(false);
+    }
+  };
+
+  const handleAddEmail = () => {
+    const email = newEmailInput.trim();
+    if (email && email.includes("@") && !sharedEmails.includes(email)) {
+      setSharedEmails([...sharedEmails, email]);
+      setNewEmailInput("");
+    }
+  };
+
+  const handleRemoveEmail = (emailToRemove: string) => {
+    setSharedEmails(sharedEmails.filter((email) => email !== emailToRemove));
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      handleAddEmail();
+    }
   };
 
   const eventCountText = `${events.length} items`;
@@ -285,6 +627,75 @@ export default function Home(): JSX.Element {
             <h1 className="text-xl font-bold text-slate-800 tracking-tight">
               Schedule Converter
             </h1>
+          </div>
+          <div className="flex items-center gap-3">
+            {!process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID && !googleClientId && (
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <input
+                  type="text"
+                  placeholder="Google Client ID"
+                  value={googleClientId}
+                  onChange={(e) => setGoogleClientId(e.target.value)}
+                  className="px-3 py-1.5 border border-slate-300 rounded-md text-xs w-64"
+                />
+              </div>
+            )}
+            {isGoogleSignedIn ? (
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 px-3 py-1.5 bg-green-50 text-green-700 rounded-lg text-sm">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    className="w-4 h-4"
+                  >
+                    <path
+                      fillRule="evenodd"
+                      d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm3.857-9.809a.75.75 0 0 0-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 1 0-1.06 1.061l2.5 2.5a.75.75 0 0 0 1.137-.089l4-5.5Z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                  <span className="text-xs font-medium">
+                    {googleUserEmail || "Connected"}
+                  </span>
+                </div>
+                <button
+                  onClick={handleGoogleSignOut}
+                  className="text-xs text-slate-500 hover:text-red-600 px-2 py-1 rounded-md hover:bg-red-50 transition-colors"
+                >
+                  Sign Out
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={handleGoogleSignIn}
+                className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 hover:border-slate-400 text-slate-700 rounded-lg text-sm font-medium transition-all shadow-sm hover:shadow"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  className="w-4 h-4"
+                >
+                  <path
+                    fill="#4285F4"
+                    d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                  />
+                </svg>
+                Connect Google
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -387,23 +798,176 @@ export default function Home(): JSX.Element {
               </span>
             </h2>
 
-            <button
-              onClick={handleDownload}
-              disabled={events.length === 0}
-              className="text-sm bg-emerald-500 hover:bg-emerald-600 disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-lg transition-all flex items-center gap-2 shadow-sm active:scale-95"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 20 20"
-                fill="currentColor"
-                className="w-4 h-4"
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowEmailManager(!showEmailManager)}
+                className="text-sm bg-slate-500 hover:bg-slate-600 text-white font-medium py-2 px-3 rounded-lg transition-all flex items-center gap-2 shadow-sm active:scale-95"
+                title="Manage shared emails"
               >
-                <path d="M10.75 2.75a.75.75 0 0 0-1.5 0v8.614L6.295 8.235a.75.75 0 1 0-1.09 1.03l4.25 4.5a.75.75 0 0 0 1.09 0l4.25-4.5a.75.75 0 0 0-1.09-1.03l-2.965 3.129V2.75Z" />
-                <path d="M3.5 12.75a.75.75 0 0 0-1.5 0v2.5A2.75 2.75 0 0 0 4.75 18h10.5A2.75 2.75 0 0 0 18 15.25v-2.5a.75.75 0 0 0-1.5 0v2.5c0 .69-.56 1.25-1.25 1.25H4.75c-.69 0-1.25-.56-1.25-1.25v-2.5Z" />
-              </svg>
-              Download ICS
-            </button>
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  className="w-4 h-4"
+                >
+                  <path d="M3 4a2 2 0 0 0-2 2v1.161l8.441 4.221a1.25 1.25 0 0 0 1.118 0L18 7.162V6a2 2 0 0 0-2-2H3Z" />
+                  <path d="m19 8.839-7.77 3.885a2.75 2.75 0 0 1-2.46 0L1 8.839V14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8.839Z" />
+                </svg>
+                {sharedEmails.length > 0 && (
+                  <span className="bg-white text-slate-600 text-xs px-1.5 py-0.5 rounded-full font-semibold">
+                    {sharedEmails.length}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={handleAddToGoogleCalendar}
+                disabled={events.length === 0 || isAddingToCalendar}
+                className="text-sm bg-blue-500 hover:bg-blue-600 disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-lg transition-all flex items-center gap-2 shadow-sm active:scale-95"
+              >
+                {isAddingToCalendar ? (
+                  <>
+                    <svg
+                      className="animate-spin h-4 w-4"
+                      xmlns="http://www.w3.org/2000/svg"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                    >
+                      <circle
+                        className="opacity-25"
+                        cx="12"
+                        cy="12"
+                        r="10"
+                        stroke="currentColor"
+                        strokeWidth="4"
+                      ></circle>
+                      <path
+                        className="opacity-75"
+                        fill="currentColor"
+                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                      ></path>
+                    </svg>
+                    Adding...
+                  </>
+                ) : (
+                  <>
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 24 24"
+                      fill="currentColor"
+                      className="w-4 h-4"
+                    >
+                      <path d="M12.75 12.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0ZM7.5 15.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM8.25 17.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0ZM9.75 15.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM10.5 17.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0ZM12 15.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM12.75 17.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0ZM14.25 15.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM15 17.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0ZM16.5 15.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM15 12.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0ZM16.5 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" />
+                      <path
+                        fillRule="evenodd"
+                        d="M6.75 2.25A.75.75 0 0 1 7.5 3v1.5h9V3A.75.75 0 0 1 18 3v1.5h.75a3 3 0 0 1 3 3v11.25a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3V7.5a3 3 0 0 1 3-3H6V3a.75.75 0 0 1 .75-.75Zm13.5 9a1.5 1.5 0 0 0-1.5-1.5H5.25a1.5 1.5 0 0 0-1.5 1.5v7.5a1.5 1.5 0 0 0 1.5 1.5h13.5a1.5 1.5 0 0 0 1.5-1.5v-7.5Z"
+                        clipRule="evenodd"
+                      />
+                    </svg>
+                    {isGoogleSignedIn
+                      ? "Add to Google Calendar"
+                      : "Connect & Add"}
+                  </>
+                )}
+              </button>
+              <button
+                onClick={handleDownload}
+                disabled={events.length === 0}
+                className="text-sm bg-emerald-500 hover:bg-emerald-600 disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-lg transition-all flex items-center gap-2 shadow-sm active:scale-95"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  className="w-4 h-4"
+                >
+                  <path d="M10.75 2.75a.75.75 0 0 0-1.5 0v8.614L6.295 8.235a.75.75 0 1 0-1.09 1.03l4.25 4.5a.75.75 0 0 0 1.09 0l4.25-4.5a.75.75 0 0 0-1.09-1.03l-2.965 3.129V2.75Z" />
+                  <path d="M3.5 12.75a.75.75 0 0 0-1.5 0v2.5A2.75 2.75 0 0 0 4.75 18h10.5A2.75 2.75 0 0 0 18 15.25v-2.5a.75.75 0 0 0-1.5 0v2.5c0 .69-.56 1.25-1.25 1.25H4.75c-.69 0-1.25-.56-1.25-1.25v-2.5Z" />
+                </svg>
+                Download ICS
+              </button>
+            </div>
           </div>
+
+          {/* Email Manager */}
+          {showEmailManager && (
+            <div className="mb-4 bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-semibold text-slate-700 text-sm flex items-center gap-2">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    className="w-4 h-4"
+                  >
+                    <path d="M3 4a2 2 0 0 0-2 2v1.161l8.441 4.221a1.25 1.25 0 0 0 1.118 0L18 7.162V6a2 2 0 0 0-2-2H3Z" />
+                    <path d="m19 8.839-7.77 3.885a2.75 2.75 0 0 1-2.46 0L1 8.839V14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8.839Z" />
+                  </svg>
+                  Shared Emails ({sharedEmails.length})
+                </h3>
+                <button
+                  onClick={() => setShowEmailManager(false)}
+                  className="text-slate-400 hover:text-slate-600 transition-colors"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    className="w-4 h-4"
+                  >
+                    <path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z" />
+                  </svg>
+                </button>
+              </div>
+              <div className="flex gap-2 mb-3">
+                <input
+                  type="email"
+                  value={newEmailInput}
+                  onChange={(e) => setNewEmailInput(e.target.value)}
+                  onKeyPress={handleKeyPress}
+                  placeholder="Enter email address"
+                  className="flex-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+                />
+                <button
+                  onClick={handleAddEmail}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors"
+                >
+                  Add
+                </button>
+              </div>
+              {sharedEmails.length > 0 ? (
+                <div className="space-y-2 max-h-40 overflow-y-auto">
+                  {sharedEmails.map((email, index) => (
+                    <div
+                      key={index}
+                      className="flex items-center justify-between px-3 py-2 bg-slate-50 rounded-lg text-sm"
+                    >
+                      <span className="text-slate-700">{email}</span>
+                      <button
+                        onClick={() => handleRemoveEmail(email)}
+                        className="text-red-500 hover:text-red-700 transition-colors"
+                      >
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          viewBox="0 0 20 20"
+                          fill="currentColor"
+                          className="w-4 h-4"
+                        >
+                          <path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z" />
+                        </svg>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-400 text-center py-4">
+                  No emails added. Events will not be shared with anyone.
+                </p>
+              )}
+              <p className="text-xs text-slate-500 mt-3">
+                These emails will be added as attendees to all calendar events.
+              </p>
+            </div>
+          )}
 
           <div className="flex-1 overflow-y-auto relative rounded-2xl bg-slate-50/50 border border-slate-200/60 p-1">
             <div className="space-y-3 p-2 md:p-3 absolute inset-0 overflow-y-auto">
