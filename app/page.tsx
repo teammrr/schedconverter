@@ -1,7 +1,7 @@
 "use client";
 import React, { JSX, useRef, useState } from "react";
 
-// /Users/suteemonv/Codes/Github/SchedConvert/schedconvert/app/main.tsx
+// /Users/suteemonv/Codes/Github/SchedConvert/schedconvert/app/page.tsx
 
 /**
  * Converted from original plain HTML+JS to a React + TypeScript (TSX) component.
